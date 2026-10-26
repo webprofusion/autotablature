@@ -36,7 +36,7 @@ def test_audio_processor(config, input_file):
         print(f"Sample rate: {sr} Hz")
         
         # Preprocess
-        features = processor.preprocess((audio, sr))
+        features = processor.preprocess(audio)
         print(f"Extracted features:")
         for key, value in features.items():
             if isinstance(value, np.ndarray):

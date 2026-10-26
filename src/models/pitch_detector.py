@@ -334,11 +334,13 @@ class PitchDetector:
 class PitchCNN(nn.Module):
     """Convolutional Neural Network for pitch detection."""
     
-    def __init__(self, input_size, n_bins):
+    def __init__(self, input_size, n_bins, chunk_size=256):
         super(PitchCNN, self).__init__()
-        
+
         self.input_size = input_size
         self.n_bins = n_bins
+        # Frames per chunk; bounds conv activation memory (128 x input_size per frame)
+        self.chunk_size = chunk_size
         
         # Convolutional layers
         self.conv1 = nn.Conv1d(1, 32, kernel_size=25, padding=12)
@@ -358,33 +360,24 @@ class PitchCNN(nn.Module):
     def forward(self, x):
         """Forward pass through the network."""
         # Input shape: (batch_size, sequence_length, input_size)
-        x = x.transpose(1, 2)  # (batch_size, input_size, sequence_length)
-        x = x.unsqueeze(1)     # (batch_size, 1, input_size, sequence_length)
-        
-        # Apply convolutions along frequency axis
-        x = x.squeeze(1).transpose(1, 2)  # (batch_size, sequence_length, input_size)
-        x = x.transpose(1, 2)  # (batch_size, input_size, sequence_length)
-        
-        # Convolutional layers
-        x = self.relu(self.conv1(x.unsqueeze(1).squeeze(1)))
-        x = self.relu(self.conv2(x))
-        x = self.relu(self.conv3(x))
-        
-        # Flatten for fully connected layers
-        x = x.transpose(1, 2)  # (batch_size, sequence_length, 128)
-        batch_size, seq_len, features = x.shape
-        
-        # Process each frame
+        batch_size, seq_len, input_size = x.shape
+
+        # Treat every frame as its own 1-channel signal so the convolutions
+        # slide along the frequency axis: (batch_size * sequence_length, 1, input_size)
+        frames = x.reshape(batch_size * seq_len, 1, input_size)
+
         outputs = []
-        for t in range(seq_len):
-            frame = x[:, t, :].contiguous().view(batch_size, -1)
-            
-            out = self.relu(self.fc1(frame))
+        for chunk in torch.split(frames, self.chunk_size):
+            out = self.relu(self.conv1(chunk))
+            out = self.relu(self.conv2(out))
+            out = self.relu(self.conv3(out))  # (chunk, 128, input_size)
+
+            out = out.flatten(1)  # (chunk, 128 * input_size)
+            out = self.relu(self.fc1(out))
             out = self.dropout(out)
             out = self.relu(self.fc2(out))
             out = self.dropout(out)
-            out = self.sigmoid(self.fc3(out))
-            
-            outputs.append(out.unsqueeze(1))
-        
-        return torch.cat(outputs, dim=1)
+            outputs.append(self.sigmoid(self.fc3(out)))
+
+        # (batch_size, sequence_length, n_bins)
+        return torch.cat(outputs).reshape(batch_size, seq_len, self.n_bins)

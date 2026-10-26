@@ -426,14 +426,24 @@ class TablatureTrack:
 
 class TablatureDocument:
     """Represents a complete tablature document."""
-    
+
+    # Export grid resolution: note onsets are quantized to sixteenth notes
+    SLOTS_PER_WHOLE = 16
+    # (channel, effect channel) MIDI pairs per track; channel 9 is reserved for percussion
+    GP_CHANNEL_PAIRS = [(0, 1), (2, 3), (4, 5), (6, 7), (10, 11), (12, 13), (14, 15)]
+    # ASCII tab layout: characters per grid slot, and measures per line of tab
+    ASCII_SLOT_WIDTH = 3
+    ASCII_MEASURES_PER_LINE = 2
+    NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
     def __init__(self):
         self.tracks = []
         self.title = ""
         self.artist = ""
         self.album = ""
         self.copyright = ""
-    
+        self.logger = logging.getLogger(__name__)
+
     def add_track(self, track):
         self.tracks.append(track)
     
@@ -447,8 +457,12 @@ class TablatureDocument:
         """Save tablature to file."""
         if filename.endswith('.json'):
             self._save_json(filename)
-        elif filename.endswith('.gp5') or filename.endswith('.gpx'):
+        elif filename.endswith('.gp5'):
             self._save_guitar_pro(filename)
+        elif filename.endswith('.txt'):
+            self._save_ascii(filename)
+        elif filename.endswith('.gpx'):
+            raise ValueError("PyGuitarPro cannot write Guitar Pro 6 (.gpx) files; use .gp5")
         else:
             raise ValueError(f"Unsupported file format: {filename}")
     
@@ -464,57 +478,149 @@ class TablatureDocument:
         
         with open(filename, 'w') as f:
             json.dump(data, f, indent=2)
-    
+
+    def _save_ascii(self, filename):
+        """Save as plain-text ASCII tab."""
+        with open(filename, 'w') as f:
+            f.write(self.to_ascii())
+
+    def to_ascii(self):
+        """
+        Render the document as ASCII tab on the sixteenth-note export grid.
+
+        Each grid slot shows the fret of a note starting there, or dashes.
+        """
+        lines = [f"{self.title or 'AutoTablature Generated'} - {self.artist or 'AutoTablature'}"]
+
+        for track_number, track in enumerate(self.tracks, start=1):
+            # Tuning is listed from string 1 (highest) down
+            labels = [self.NOTE_NAMES[midi_note % 12] for midi_note in track.tuning]
+            labels[0] = labels[0].lower()  # conventional lowercase high e
+            lines += [
+                "",
+                f"Track {track_number}: {track.instrument} ({track.tempo:.0f} BPM, "
+                f"tuning {' '.join(reversed(labels))}, low to high)",
+                "",
+            ]
+
+            measures = [
+                self._ascii_measure(measure, len(track.tuning)) for measure in track.measures
+            ]
+            for start in range(0, len(measures), self.ASCII_MEASURES_PER_LINE):
+                group = measures[start:start + self.ASCII_MEASURES_PER_LINE]
+                header = "   "
+                for offset, (time_signature, rows) in enumerate(group):
+                    title = f"m{start + offset + 1} ({time_signature[0]}/{time_signature[1]})"
+                    header += title.ljust(len(rows[0]) + 1)
+                lines.append(header.rstrip())
+                for string_index, label in enumerate(labels):
+                    lines.append(f"{label:<2}|" + "".join(rows[string_index] + "|" for _, rows in group))
+                lines.append("")
+
+        return "\n".join(lines) + "\n"
+
+    def _ascii_measure(self, measure, num_strings):
+        """Render one measure as a row of text per string."""
+        slots_per_measure, notes_by_slot = self._quantize_notes(measure.notes, measure.time_signature)
+        empty = "-" * self.ASCII_SLOT_WIDTH
+        rows = [[empty] * slots_per_measure for _ in range(num_strings)]
+
+        for slot, by_string in notes_by_slot.items():
+            for string, note in by_string.items():
+                if 1 <= string <= num_strings:
+                    rows[string - 1][slot] = str(self._fret_number(note)).ljust(self.ASCII_SLOT_WIDTH, "-")
+
+        return measure.time_signature, ["".join(row) for row in rows]
+
+    def _quantize_notes(self, notes, time_signature):
+        """
+        Quantize note onsets in a measure to the export grid.
+
+        Returns:
+            tuple: (slots_per_measure, {slot: {string: note}}), keeping the most
+            confident note when several land on the same string and slot
+        """
+        numerator, denominator = time_signature
+        slots_per_beat = self.SLOTS_PER_WHOLE // denominator
+        slots_per_measure = numerator * slots_per_beat
+
+        notes_by_slot = {}
+        for note in notes:
+            slot = int(round(note.beat_position * slots_per_beat))
+            slot = min(max(slot, 0), slots_per_measure - 1)
+            by_string = notes_by_slot.setdefault(slot, {})
+            current = by_string.get(note.string)
+            if current is None or note.confidence > current.confidence:
+                by_string[note.string] = note
+
+        return slots_per_measure, notes_by_slot
+
+    def _fret_number(self, tab_note):
+        """Fret as a non-negative integer (the generator can produce fractional frets)."""
+        return max(0, int(round(tab_note.fret)))
+
     def _save_guitar_pro(self, filename):
-        """Save in Guitar Pro format."""
+        """Save in Guitar Pro 5 format."""
         try:
             self.logger.info(f"Creating Guitar Pro file: {filename}")
-            
-            # Create a new Guitar Pro file
-            gp_song = guitarpro.models.Song()
-            
-            # Set song information
-            gp_song.title = self.title or "AutoTablature Generated"
-            gp_song.artist = self.artist or "AutoTablature"
-            gp_song.album = self.album or ""
-            
-            # Determine appropriate version based on file extension
-            if filename.endswith('.gpx'):
-                gp_version = 6.0
-            else:  # Default to GP5 format
-                gp_version = 5.0
-            
-            # Process each track
-            for track_idx, track in enumerate(self.tracks):
-                # Create Guitar Pro track
-                gp_track = guitarpro.models.Track()
-                gp_track.name = track.instrument
-                gp_track.channel.instrument = self._get_gp_instrument_id(track.instrument)
-                gp_track.channel.volume = 100
-                gp_track.channel.balance = 64  # Center
-                gp_track.channel.chorus = 0
-                gp_track.channel.reverb = 0
-                gp_track.channel.phaser = 0
-                gp_track.channel.tremolo = 0
-                gp_track.strings = self._create_gp_strings(track.tuning)
-                
-                # Add measures with their notes
-                for measure_idx, measure in enumerate(track.measures):
-                    # Create a Guitar Pro measure
-                    gp_measure = self._create_gp_measure(measure, measure_idx, gp_version)
-                    gp_track.measures.append(gp_measure)
-                
-                # Add track to song
+
+            if not self.tracks:
+                raise ValueError("No tracks to save")
+
+            gp_song = guitarpro.models.Song(
+                title=self.title or "AutoTablature Generated",
+                artist=self.artist or "AutoTablature",
+                album=self.album or "",
+                copyright=self.copyright or "",
+                tempo=int(round(self.tracks[0].tempo)),
+            )
+            # Song() starts with one default track and measure; build our own
+            gp_song.tracks = []
+            gp_song.measureHeaders = []
+
+            # Measure headers are shared by every track, so size them to the longest track
+            longest = max(self.tracks, key=lambda track: len(track.measures))
+            start = guitarpro.models.Duration.quarterTime
+            for index in range(max(len(longest.measures), 1)):
+                numerator, denominator = (
+                    longest.measures[index].time_signature if longest.measures else (4, 4)
+                )
+                header = guitarpro.models.MeasureHeader(number=index + 1, start=start)
+                header.timeSignature.numerator = numerator
+                header.timeSignature.denominator.value = denominator
+                gp_song.addMeasureHeader(header)
+                start += header.length
+
+            for track_index, track in enumerate(self.tracks):
+                channel, effect_channel = self.GP_CHANNEL_PAIRS[track_index % len(self.GP_CHANNEL_PAIRS)]
+                gp_track = guitarpro.models.Track(
+                    gp_song,
+                    number=track_index + 1,
+                    name=track.instrument,
+                    strings=self._create_gp_strings(track.tuning),
+                    channel=guitarpro.models.MidiChannel(
+                        channel=channel,
+                        effectChannel=effect_channel,
+                        instrument=self._get_gp_instrument_id(track.instrument),
+                        volume=100,
+                    ),
+                )
+
+                # Track() creates one empty measure per song header; fill those in.
+                # Tracks shorter than the longest one are padded with rest measures
+                for index, gp_measure in enumerate(gp_track.measures):
+                    notes = track.measures[index].notes if index < len(track.measures) else []
+                    self._fill_gp_voice(gp_measure.voices[0], notes, gp_measure.header)
+
                 gp_song.tracks.append(gp_track)
-            
-            # Write to file
+
             guitarpro.write(gp_song, filename)
             self.logger.info(f"Successfully saved Guitar Pro file to {filename}")
-            
+
         except Exception as e:
             self.logger.error(f"Error saving Guitar Pro file: {e}")
             # Fallback to JSON
-            json_filename = filename.replace('.gp5', '.json').replace('.gpx', '.json')
+            json_filename = filename.replace('.gp5', '.json')
             self.logger.warning(f"Falling back to JSON format: {json_filename}")
             self._save_json(json_filename)
     
@@ -545,104 +651,51 @@ class TablatureDocument:
             
         return gp_strings
     
-    def _create_gp_measure(self, measure, index, gp_version):
-        """Create a Guitar Pro measure from a tablature measure."""
-        gp_measure = guitarpro.models.Measure()
-        
-        # Set time signature
-        if index == 0 or measure.time_signature != (4, 4):  # First measure or non-standard time sig
-            gp_measure.header = guitarpro.models.MeasureHeader()
-            gp_measure.header.timeSignature.numerator = measure.time_signature[0]
-            gp_measure.header.timeSignature.denominator.value = measure.time_signature[1]
-        
-        # Create beats based on notes
-        self._create_beats_for_measure(gp_measure, measure)
-        
-        return gp_measure
-    
-    def _create_beats_for_measure(self, gp_measure, measure):
-        """Create beats with notes for a Guitar Pro measure."""
-        # Group notes by beat position
-        notes_by_position = {}
-        for note in measure.notes:
-            position = round(note.beat_position * 4) / 4  # Quantize to nearest quarter/eighth/etc
-            if position not in notes_by_position:
-                notes_by_position[position] = []
-            notes_by_position[position].append(note)
-        
-        # Create beats in position order
-        positions = sorted(notes_by_position.keys())
-        
-        for i, position in enumerate(positions):
-            # Create a new beat
-            gp_beat = guitarpro.models.Beat()
-            
-            # Set beat duration
-            if i < len(positions) - 1:
-                # Calculate duration from current to next position
-                duration = positions[i + 1] - position
+    def _fill_gp_voice(self, gp_voice, notes, header):
+        """Fill a Guitar Pro voice with beats that cover the whole measure."""
+        time_signature = (header.timeSignature.numerator, header.timeSignature.denominator.value)
+        slots_per_measure, notes_by_slot = self._quantize_notes(notes, time_signature)
+        onsets = sorted(notes_by_slot)
+
+        # Leading rest before the first note (or a whole-measure rest if empty)
+        first_onset = onsets[0] if onsets else slots_per_measure
+        self._append_gp_beats(gp_voice, first_onset, [])
+
+        # Each chord lasts until the next onset or the end of the measure
+        for onset, next_onset in zip(onsets, onsets[1:] + [slots_per_measure]):
+            self._append_gp_beats(gp_voice, next_onset - onset, list(notes_by_slot[onset].values()))
+
+    def _append_gp_beats(self, gp_voice, length, tab_notes):
+        """
+        Append beats spanning `length` grid slots to a voice.
+
+        Lengths that are not a single note value are split into several beats;
+        the notes are tied across them, and empty spans become rests.
+        """
+        tie = False
+        while length > 0:
+            piece = next(size for size in (16, 8, 4, 2, 1) if size <= length)
+            length -= piece
+
+            gp_beat = guitarpro.models.Beat(
+                gp_voice,
+                duration=guitarpro.models.Duration(value=self.SLOTS_PER_WHOLE // piece),
+            )
+            if tab_notes:
+                gp_beat.status = guitarpro.models.BeatStatus.normal
+                for tab_note in tab_notes:
+                    gp_beat.notes.append(self._create_gp_note(gp_beat, tab_note, tie))
             else:
-                # Last beat - use quarter note duration as default
-                duration = 0.25
-            
-            # Set duration properties
-            beat_duration = self._get_gp_duration(duration)
-            gp_beat.duration = beat_duration
-            
-            # Add notes to beat
-            for tab_note in notes_by_position[position]:
-                gp_note = self._create_gp_note(tab_note)
-                gp_beat.notes.append(gp_note)
-            
-            # Add beat to measure
-            voice = guitarpro.models.Voice()
-            voice.beats.append(gp_beat)
-            gp_measure.voices.append(voice)
-    
-    def _get_gp_duration(self, duration):
-        """Convert duration value to Guitar Pro duration object."""
-        # Map durations to GP format
-        gp_duration = guitarpro.models.Duration()
-        
-        if duration >= 1.0:
-            gp_duration.value = guitarpro.models.Duration.whole
-        elif duration >= 0.5:
-            gp_duration.value = guitarpro.models.Duration.half
-        elif duration >= 0.25:
-            gp_duration.value = guitarpro.models.Duration.quarter
-        elif duration >= 0.125:
-            gp_duration.value = guitarpro.models.Duration.eighth
-        elif duration >= 0.0625:
-            gp_duration.value = guitarpro.models.Duration.sixteenth
-        else:
-            gp_duration.value = guitarpro.models.Duration.thirtySecond
-        
-        return gp_duration
-    
-    def _create_gp_note(self, tab_note):
+                gp_beat.status = guitarpro.models.BeatStatus.rest
+
+            gp_voice.beats.append(gp_beat)
+            tie = True
+
+    def _create_gp_note(self, gp_beat, tab_note, tie=False):
         """Create a Guitar Pro note from a tablature note."""
-        gp_note = guitarpro.models.Note()
-        
-        # Set string and fret
-        gp_note.string = tab_note.string
-        gp_note.value = tab_note.fret
-        
-        # Set default properties
-        gp_note.type = guitarpro.models.NoteType.normal
-        gp_note.duration = guitarpro.models.Duration()
-        gp_note.duration.value = self._get_duration_value(tab_note.duration)
-        
-        return gp_note
-    
-    def _get_duration_value(self, duration_name):
-        """Convert duration name to Guitar Pro duration value."""
-        duration_map = {
-            'whole': guitarpro.models.Duration.whole,
-            'half': guitarpro.models.Duration.half,
-            'quarter': guitarpro.models.Duration.quarter, 
-            'eighth': guitarpro.models.Duration.eighth,
-            'sixteenth': guitarpro.models.Duration.sixteenth,
-            'thirty-second': guitarpro.models.Duration.thirtySecond
-        }
-        
-        return duration_map.get(duration_name, guitarpro.models.Duration.quarter)
+        return guitarpro.models.Note(
+            gp_beat,
+            value=self._fret_number(tab_note),
+            string=tab_note.string,
+            type=guitarpro.models.NoteType.tie if tie else guitarpro.models.NoteType.normal,
+        )

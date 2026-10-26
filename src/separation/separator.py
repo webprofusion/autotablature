@@ -201,14 +201,14 @@ class UNetSeparator(nn.Module):
         # Bottleneck
         self.bottleneck = self._conv_block(features * 8, features * 16)
         
-        # Decoder
+        # Decoder (each skip connection doubles the channels fed to the next block)
         self.dec4 = self._upconv_block(features * 16, features * 8)
-        self.dec3 = self._upconv_block(features * 8, features * 4)
-        self.dec2 = self._upconv_block(features * 4, features * 2)
-        self.dec1 = self._upconv_block(features * 2, features)
-        
+        self.dec3 = self._upconv_block(features * 16, features * 4)
+        self.dec2 = self._upconv_block(features * 8, features * 2)
+        self.dec1 = self._upconv_block(features * 4, features)
+
         # Output layer
-        self.output = nn.Conv2d(features, output_channels, kernel_size=1)
+        self.output = nn.Conv2d(features * 2, output_channels, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
     
     def _conv_block(self, in_channels, out_channels):
@@ -232,6 +232,11 @@ class UNetSeparator(nn.Module):
     
     def forward(self, x):
         """Forward pass through the U-Net."""
+        # Pad height and width to a multiple of 16 so the four pool/upsample
+        # stages line up with the skip connections; cropped back at the end
+        height, width = x.shape[-2:]
+        x = nn.functional.pad(x, (0, -width % 16, 0, -height % 16))
+
         # Encoder
         e1 = self.enc1(x)
         e2 = self.enc2(nn.MaxPool2d(2)(e1))
@@ -256,4 +261,4 @@ class UNetSeparator(nn.Module):
         
         # Output
         output = self.output(d1)
-        return self.sigmoid(output)
+        return self.sigmoid(output[..., :height, :width])

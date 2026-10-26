@@ -81,10 +81,11 @@ class RhythmAnalyzer:
             y=audio,
             sr=self.sample_rate,
             hop_length=self.hop_length,
-            start_bpm=60,
-            std_bpm=1.0
+            start_bpm=60
         )
-        
+        # librosa >= 0.10 returns tempo as a 1-element array
+        tempo = float(np.atleast_1d(tempo)[0])
+
         # Convert beat frames to time
         beat_times = librosa.frames_to_time(beats, sr=self.sample_rate, hop_length=self.hop_length)
         

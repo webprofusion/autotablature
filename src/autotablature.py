@@ -51,7 +51,7 @@ class AutoTablature:
         self.logger.info(f"Processing audio file: {audio_path}")
         
         # Step 1: Load and preprocess audio
-        audio_data = self.audio_processor.load_audio(audio_path)
+        audio_data, _ = self.audio_processor.load_audio(audio_path)
         processed_audio = self.audio_processor.preprocess(audio_data)
         
         # Step 2: Separate instruments
